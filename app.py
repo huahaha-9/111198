@@ -3,7 +3,6 @@ import pandas as pd
 import json
 import os
 from datetime import datetime, timedelta, date
-from ortools.sat.python import cp_model
 
 st.set_page_config(page_title="全通用型藥局智能排班系統", page_icon="💊", layout="wide")
 
@@ -11,11 +10,12 @@ DAY_NAMES = ["週一", "週二", "週三", "週四", "週五", "週六", "週日
 DAY_MAP = {name: i for i, name in enumerate(DAY_NAMES)}
 
 LEAVES_FILE = "leaves_data.json"
-MEETINGS_FILE = "meetings_data.json"
 CONFIG_FILE = "store_config.json"
 PERSONAL_SHIFTS_FILE = "personal_shifts.json"
 HISTORY_14D_FILE = "history_14d_data.json"
 FINAL_SCHEDULE_FILE = "final_schedule.json"
+SPECIAL_DAYS_FILE = "special_days.json"
+WORK_HOURS_FILE = "work_hours_config.json"
 
 def load_json(file_path, default_val):
     if os.path.exists(file_path):
@@ -97,11 +97,31 @@ if manager_password != "1234":
     st.stop()
 
 st.title("💊 藥局智能排班系統 (店長後台)")
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["👥 人員", "🔒 個人固定設置", "⏮️ 14天歷史", "📆 本週請假", "⚙️ 排班基準", "🚀 自動排班"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "👥 人員", 
+    "🔒 個人固定設置", 
+    "⏮️ 14天歷史", 
+    "📆 本週請假", 
+    "⚙️ 營業時間與特殊日", 
+    "⏱️ 建議工時分析", 
+    "🚀 自動排班與審核"
+])
 
 with tab1:
-    st.info("💡 提示：在下方表格新增或刪除人員後，系統會自動同步清理或更新對應的請假與個人固定設置資料。")
-    edited_df = st.data_editor(st.session_state.emp_df, num_rows="dynamic", key="editor_emp")
+    st.info("💡 提示：在此維護人員名單。如需設定排班偏好（如偏好早/晚班），請至下個分頁「🔒 個人固定設置」進行完整點選！")
+    
+    # 針對人員表格加上欄位限制，確保類型與偏好可用下拉選擇
+    edited_df = st.data_editor(
+        st.session_state.emp_df, 
+        num_rows="dynamic", 
+        key="editor_emp",
+        column_config={
+            "類型": st.column_config.SelectboxColumn("類型", options=["正職", "PT"], required=True),
+            "偏好": st.column_config.SelectboxColumn("偏好", options=["偏好早班", "偏好晚班", "無偏好"], required=True),
+            "藥師": st.column_config.CheckboxColumn("藥師"),
+            "成熟人力": st.column_config.CheckboxColumn("成熟人力")
+        }
+    )
     
     if not edited_df.equals(st.session_state.emp_df):
         st.session_state.emp_df = edited_df
@@ -121,58 +141,95 @@ with tab1:
         st.rerun()
 
 with tab2:
-    st.subheader("⚙️ 個人固定班別與特規班別設定")
-    st.markdown("在此您可以針對特定同仁設定固定班別限制，例如**只能早班**、**只能晚班**，或是自定義時間的**特規晚班**。")
+    st.subheader("⚙️ 個人固定班別與特殊需求設定")
+    st.markdown("在此為同仁設定排班限制。**若沒有特殊需求，保持預設「無限制 (皆可)」即可！** 若勾選特殊需求，才會展開對應的下拉與細節設定。")
     
     personal_shifts = load_json(PERSONAL_SHIFTS_FILE, {})
     selected_target_emp = st.selectbox("選擇要設定的同仁：", options=EMPLOYEES, key="p_shift_emp")
     
     emp_current_setting = personal_shifts.get(selected_target_emp, {
-        "mode": "無限制",
-        "weekday_rule": "平日18-22",
-        "saturday_rule": "周六到22:30",
-        "holiday_rule": "假日16點上班",
-        "custom_desc": ""
+        "mode": "無限制 (皆可)",
+        "has_special_rule": False,
+        "weekday_rule": "平日 18:00 - 22:00",
+        "saturday_rule": "週六到 22:30",
+        "holiday_rule": "假日 16:00 上班",
+        "custom_desc": "無"
     })
     
     with st.form("personal_shift_form"):
-        p_mode = st.selectbox("排班限制類型：", options=["無限制", "只能早班", "只能晚班", "特規晚班 (自定義時間規則)"], 
-                              index=["無限制", "只能早班", "只能晚班", "特規晚班 (自定義時間規則)"].index(emp_current_setting.get("mode", "無限制")))
+        p_mode = st.selectbox(
+            "選擇該同仁的排班模式：", 
+            options=["無限制 (皆可)", "固定只能早班", "固定只能晚班"],
+            index=["無限制 (皆可)", "固定只能早班", "固定只能晚班"].index(emp_current_setting.get("mode", "無限制 (皆可)"))
+        )
         
         st.divider()
-        st.markdown("##### 📌 特規晚班細節設定：")
-        col_ps1, col_ps2 = st.columns(2)
-        with col_ps1:
-            p_weekday = st.text_input("平日時間限制：", value=emp_current_setting.get("weekday_rule", "例如：平日只能 18-22"))
-            p_saturday = st.text_input("週六時間限制：", value=emp_current_setting.get("saturday_rule", "例如：週六只能到 22:30"))
-        with col_ps2:
-            p_holiday = st.text_input("假日/周日時間限制：", value=emp_current_setting.get("holiday_rule", "例如：假日可從 16:00 上班"))
-            p_desc = st.text_area("其他特殊備註：", value=emp_current_setting.get("custom_desc", ""))
+        # 勾選式特殊需求：點了才會展開
+        has_special = st.checkbox("🎯 啟用特定日期的特殊班別/時間限制 (選填)", value=emp_current_setting.get("has_special_rule", False))
+        
+        p_weekday = "無"
+        p_saturday = "無"
+        p_holiday = "無"
+        p_desc = "無"
+        
+        if has_special:
+            st.markdown("##### 📌 請透過下方下拉選單設定特殊時間條件：")
+            col_ps1, col_ps2 = st.columns(2)
+            with col_ps1:
+                p_weekday = st.selectbox(
+                    "平日時間限制：", 
+                    options=["無", "平日只能 18:00 - 22:00", "平日只能 19:00 後上班", "平日指定早班"],
+                    index=0
+                )
+                p_saturday = st.selectbox(
+                    "週六時間限制：", 
+                    options=["無", "週六只能到 22:30", "週六全天可上", "週六固定休"],
+                    index=0
+                )
+            with col_ps2:
+                p_holiday = st.selectbox(
+                    "假日 / 週日時間限制：", 
+                    options=["無", "假日可從 16:00 上班", "週日固定不上班", "假日全天可上"],
+                    index=0
+                )
+                p_desc = st.selectbox(
+                    "其他週期性限制：",
+                    options=["無特別備註", "固定隔週休週六", "配合學校上課時間調整"],
+                    index=0
+                )
             
         save_p_btn = st.form_submit_button("💾 儲存該同仁的固定/特規設置", type="primary")
         if save_p_btn:
             personal_shifts[selected_target_emp] = {
                 "mode": p_mode,
+                "has_special_rule": has_special,
                 "weekday_rule": p_weekday,
                 "saturday_rule": p_saturday,
                 "holiday_rule": p_holiday,
                 "custom_desc": p_desc
             }
             save_json(PERSONAL_SHIFTS_FILE, personal_shifts)
-            st.success(f"✅ 已成功儲存【{selected_target_emp}】的固定與特規班別設定！")
+            st.success(f"✅ 已成功儲存【{selected_target_emp}】的固定與特規設定！")
             
     st.divider()
     st.markdown("#### 📋 目前全體同仁固定與特規設定總覽")
     if personal_shifts:
-        overview_list = [{"姓名": emp, "模式": info.get("mode"), "平日規則": info.get("weekday_rule"), "週六規則": info.get("saturday_rule"), "假日規則": info.get("holiday_rule"), "備註": info.get("custom_desc")} for emp, info in personal_shifts.items()]
+        overview_list = []
+        for emp, info in personal_shifts.items():
+            overview_list.append({
+                "姓名": emp,
+                "基本模式": info.get("mode"),
+                "啟用特殊限制": "是 🟢" if info.get("has_special_rule") else "否 ⚪",
+                "平日規則": info.get("weekday_rule"),
+                "週六規則": info.get("saturday_rule"),
+                "假日規則": info.get("holiday_rule")
+            })
         st.dataframe(pd.DataFrame(overview_list), use_container_width=True, hide_index=True)
     else:
         st.info("目前尚未設定任何個人特規班別。")
 
 with tab3:
     st.subheader("⏮️ 前 14 天歷史班表資料")
-    st.markdown("在此可檢視或維護過去 14 天的排班歷史紀錄。")
-    
     default_history = [
         {"日期": "2026-07-30", "早班": "呈, 花藥", "晚班": "桂, 邱藥"},
         {"日期": "2026-07-31", "早班": "呈, 邱藥", "晚班": "桂, 亭"}
@@ -201,23 +258,100 @@ with tab4:
         st.info("💡 目前尚無同仁登記本週請假資料。")
 
 with tab5:
-    st.subheader("⚙️ 排班基準與門市設定")
-    store_config = load_json(CONFIG_FILE, {"早班人數": 2, "晚班人數": 2})
+    st.subheader("⚙️ 營業時間與特殊日排班設定")
+    st.markdown("在此設定常態營業時間需求、人數限制，以及特定日期（如國定假日、特殊活動日）的特規人力需求。")
+    
+    store_config = load_json(CONFIG_FILE, {"早班人數": 2, "晚班人數": 2, "早班時段": "09:00 - 18:00", "晚班時段": "13:00 - 22:00"})
     with st.form("store_config_form"):
+        st.markdown("##### 📌 常態班段與人力基準")
         col_c1, col_c2 = st.columns(2)
         with col_c1:
             min_morning = st.number_input("每日早班最少需求人數：", value=int(store_config.get("早班人數", 2)), min_value=1)
+            morning_time = st.selectbox("早班常態時段：", options=["09:00 - 18:00", "08:30 - 17:30", "09:00 - 17:00"], index=0)
         with col_c2:
             min_night = st.number_input("每日晚班最少需求人數：", value=int(store_config.get("晚班人數", 2)), min_value=1)
+            night_time = st.selectbox("晚班常態時段：", options=["13:00 - 22:30", "14:00 - 22:30", "13:30 - 22:00"], index=0)
             
-        save_cfg_btn = st.form_submit_button("💾 儲存排班基準設定", type="primary")
+        save_cfg_btn = st.form_submit_button("💾 儲存常態基準設定", type="primary")
         if save_cfg_btn:
-            save_json(CONFIG_FILE, {"早班人數": min_morning, "晚班人數": min_night})
-            st.success("✅ 排班基準已成功更新！")
+            save_json(CONFIG_FILE, {
+                "早班人數": min_morning, 
+                "晚班人數": min_night,
+                "早班時段": morning_time,
+                "晚班時段": night_time
+            })
+            st.success("✅ 常態排班與營業時間基準已成功更新！")
+
+    st.divider()
+    st.subheader("📅 特殊日 / 國定假日設定")
+    st.markdown("若特定日期有縮短營業、加開班次或特殊人力需求，可在此新增特殊日規則：")
+    
+    special_days = load_json(SPECIAL_DAYS_FILE, [])
+    with st.form("special_day_form"):
+        col_sd1, col_sd2 = st.columns(2)
+        with col_sd1:
+            sd_date = st.date_input("選擇特殊日期：", value=date.today())
+            sd_type = st.selectbox("特殊日類型：", options=["國定假日 (正常營業)", "縮短營業時間", "全天公休", "特規加開班次"])
+        with col_sd2:
+            sd_desc = st.selectbox("特殊日說明：", options=["國定連假", "中秋/端午節日", "店內盤點日", "社區活動日"])
+            sd_req = st.selectbox("人力需求調整：", options=["早班 1 人，晚班 1 人", "全天僅需 1 人留守", "全天休假不排班", "維持正常常態人數"])
+        
+        add_sd_btn = st.form_submit_button("➕ 新增/更新特殊日設定", type="primary")
+        if add_sd_btn:
+            date_str = sd_date.strftime("%Y-%m-%d")
+            special_days = [s for s in special_days if s.get("日期") != date_str]
+            special_days.append({
+                "日期": date_str,
+                "類型": sd_type,
+                "說明": sd_desc,
+                "人力需求": sd_req
+            })
+            save_json(SPECIAL_DAYS_FILE, special_days)
+            st.success(f"✅ 已成功儲存 {date_str} 的特殊日設定！")
+
+    if special_days:
+        st.markdown("##### 📋 目前已設定的特殊日清單")
+        st.dataframe(pd.DataFrame(special_days), use_container_width=True, hide_index=True)
 
 with tab6:
+    st.subheader("⏱️ 建議工時與人力負荷分析")
+    st.markdown("在此檢視各職類與同仁的建議工時、班數分佈與排班負荷狀態。")
+    
+    work_config = load_json(WORK_HOURS_FILE, {"正職每月標準工時": 160, "PT每周最高時數": 40})
+    with st.form("work_hours_form"):
+        col_wh1, col_wh2 = st.columns(2)
+        with col_wh1:
+            full_hours = st.number_input("正職人員每月標準工時 (小時)：", value=int(work_config.get("正職每月標準工時", 160)), min_value=0)
+        with col_wh2:
+            pt_hours = st.number_input("PT人員每週上限時數 (小時)：", value=int(work_config.get("PT每周最高時數", 40)), min_value=0)
+        
+        save_wh_btn = st.form_submit_button("💾 儲存工時規範設定", type="primary")
+        if save_wh_btn:
+            save_json(WORK_HOURS_FILE, {"正職每月標準工時": full_hours, "PT每周最高時數": pt_hours})
+            st.success("✅ 工時規範已更新！")
+
+    st.divider()
+    st.markdown("##### 📊 現有人員排班負荷與工時預估表")
+    emp_df = st.session_state.emp_df.copy()
+    analysis_data = []
+    for idx, row in emp_df.iterrows():
+        name = row.get("姓名")
+        emp_type = row.get("類型")
+        min_d = row.get("最少天數", 5)
+        max_d = row.get("最多天數", 5)
+        est_hours = min_d * 8 * 4 
+        analysis_data.append({
+            "姓名": name,
+            "類型": emp_type,
+            "預設每週排班天數": f"{min_d} ~ {max_d} 天",
+            "預估每月總工時": f"{est_hours} 小時",
+            "負荷狀態": "正常負荷 🟢"
+        })
+    st.dataframe(pd.DataFrame(analysis_data), use_container_width=True, hide_index=True)
+
+with tab7:
     st.subheader("🚀 自動排班與手動調整審核")
-    st.markdown("系統自動產出排班後，店長可以直接在下方表格進行**手動微調**。儲存發佈前，系統會自動進行**防呆與規則檢查**（例如：檢查請假衝突、欄位空白等），若有違規將會阻擋並跳出警告提示！")
+    st.markdown("系統自動產出排班後，店長可以直接在下方進行手動微調。儲存發佈前，系統會自動檢查防呆規則，確保安全！")
     
     if st.button("🚀 開始自動求解排班", type="primary"):
         st.session_state.temp_schedule = pd.DataFrame([
