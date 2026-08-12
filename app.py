@@ -89,11 +89,15 @@ if user_role == "👤 員工專區 (查看班表/登記請假)":
         st.dataframe(pd.DataFrame(my_list), use_container_width=True, hide_index=True)
     st.stop()
 
+# 讀取店長密碼設定（預設為 1234）
+store_config = load_json(CONFIG_FILE, {"早班人數": 2, "晚班人數": 2, "早班時段": "09:00 - 18:00", "晚班時段": "13:00 - 22:30", "店長密碼": "1234"})
+correct_manager_password = store_config.get("店長密碼", "1234")
+
 st.sidebar.divider()
 manager_password = st.sidebar.text_input("請輸入店長密碼：", type="password")
-if manager_password != "1234":
+if manager_password != correct_manager_password:
     st.title("🔒 店長管理後台")
-    st.warning("⚠️ 請輸入正確的店長密碼")
+    st.warning("⚠️ 請輸入正確的店長密碼（預設密碼為：1234，登入後可至「營業時間與特殊日」分頁修改）")
     st.stop()
 
 st.title("💊 藥局智能排班系統 (店長後台)")
@@ -108,9 +112,8 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 ])
 
 with tab1:
-    st.info("💡 提示：在此維護人員名單。如需設定排班偏好（如偏好早/晚班），請至下個分頁「🔒 個人固定設置」進行完整點選！")
+    st.info("💡 提示：在此維護人員名單。如需設定排班偏好，請至下個分頁進行設定！")
     
-    # 針對人員表格加上欄位限制，確保類型與偏好可用下拉選擇
     edited_df = st.data_editor(
         st.session_state.emp_df, 
         num_rows="dynamic", 
@@ -164,7 +167,6 @@ with tab2:
         )
         
         st.divider()
-        # 勾選式特殊需求：點了才會展開
         has_special = st.checkbox("🎯 啟用特定日期的特殊班別/時間限制 (選填)", value=emp_current_setting.get("has_special_rule", False))
         
         p_weekday = "無"
@@ -259,9 +261,8 @@ with tab4:
 
 with tab5:
     st.subheader("⚙️ 營業時間與特殊日排班設定")
-    st.markdown("在此設定常態營業時間需求、人數限制，以及特定日期（如國定假日、特殊活動日）的特規人力需求。")
+    st.markdown("在此設定常態營業時間需求、人數限制，以及特定日期的特規人力需求與**店長密碼**變更。")
     
-    store_config = load_json(CONFIG_FILE, {"早班人數": 2, "晚班人數": 2, "早班時段": "09:00 - 18:00", "晚班時段": "13:00 - 22:00"})
     with st.form("store_config_form"):
         st.markdown("##### 📌 常態班段與人力基準")
         col_c1, col_c2 = st.columns(2)
@@ -272,20 +273,23 @@ with tab5:
             min_night = st.number_input("每日晚班最少需求人數：", value=int(store_config.get("晚班人數", 2)), min_value=1)
             night_time = st.selectbox("晚班常態時段：", options=["13:00 - 22:30", "14:00 - 22:30", "13:30 - 22:00"], index=0)
             
-        save_cfg_btn = st.form_submit_button("💾 儲存常態基準設定", type="primary")
+        st.divider()
+        st.markdown("##### 🔐 後台管理密碼設定")
+        new_manager_pwd = st.text_input("變更店長登入密碼：", value=store_config.get("店長密碼", "1234"), type="password")
+            
+        save_cfg_btn = st.form_submit_button("💾 儲存常態基準與密碼設定", type="primary")
         if save_cfg_btn:
             save_json(CONFIG_FILE, {
                 "早班人數": min_morning, 
                 "晚班人數": min_night,
                 "早班時段": morning_time,
-                "晚班時段": night_time
+                "晚班時段": night_time,
+                "店長密碼": new_manager_pwd
             })
-            st.success("✅ 常態排班與營業時間基準已成功更新！")
+            st.success("✅ 常態排班設定與店長密碼已成功更新！下次登入請使用新密碼。")
 
     st.divider()
     st.subheader("📅 特殊日 / 國定假日設定")
-    st.markdown("若特定日期有縮短營業、加開班次或特殊人力需求，可在此新增特殊日規則：")
-    
     special_days = load_json(SPECIAL_DAYS_FILE, [])
     with st.form("special_day_form"):
         col_sd1, col_sd2 = st.columns(2)
