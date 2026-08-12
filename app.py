@@ -107,13 +107,11 @@ with tab1:
         st.session_state.emp_df = edited_df
         current_emps = edited_df["姓名"].dropna().tolist()
         
-        # 同步清理請假資料
         leaves_data = load_json(LEAVES_FILE, {})
         updated_leaves = {emp: data for emp, data in leaves_data.items() if emp in current_emps}
         if updated_leaves != leaves_data:
             save_json(LEAVES_FILE, updated_leaves)
             
-        # 同步清理個人固定設置資料
         personal_shifts = load_json(PERSONAL_SHIFTS_FILE, {})
         updated_p_shifts = {emp: data for emp, data in personal_shifts.items() if emp in current_emps}
         if updated_p_shifts != personal_shifts:
@@ -124,7 +122,7 @@ with tab1:
 
 with tab2:
     st.subheader("⚙️ 個人固定班別與特規班別設定")
-    st.markdown("在此您可以針對特定同仁設定固定班別限制，例如**只能早班**、**只能晚班**，或是自定義時間的**特規晚班**（如平日18-22、周六到22:30、假日16點上班等）。")
+    st.markdown("在此您可以針對特定同仁設定固定班別限制，例如**只能早班**、**只能晚班**，或是自定義時間的**特規晚班**。")
     
     personal_shifts = load_json(PERSONAL_SHIFTS_FILE, {})
     selected_target_emp = st.selectbox("選擇要設定的同仁：", options=EMPLOYEES, key="p_shift_emp")
@@ -142,7 +140,7 @@ with tab2:
                               index=["無限制", "只能早班", "只能晚班", "特規晚班 (自定義時間規則)"].index(emp_current_setting.get("mode", "無限制")))
         
         st.divider()
-        st.markdown("##### 📌 特規晚班細節設定 (若選擇特規晚班請在此填寫規則與時間)：")
+        st.markdown("##### 📌 特規晚班細節設定：")
         col_ps1, col_ps2 = st.columns(2)
         with col_ps1:
             p_weekday = st.text_input("平日時間限制：", value=emp_current_setting.get("weekday_rule", "例如：平日只能 18-22"))
@@ -166,29 +164,89 @@ with tab2:
     st.divider()
     st.markdown("#### 📋 目前全體同仁固定與特規設定總覽")
     if personal_shifts:
-        overview_list = []
-        for emp, info in personal_shifts.items():
-            overview_list.append({
-                "姓名": emp,
-                "模式": info.get("mode"),
-                "平日規則": info.get("weekday_rule"),
-                "週六規則": info.get("saturday_rule"),
-                "假日規則": info.get("holiday_rule"),
-                "備註": info.get("custom_desc")
-            })
+        overview_list = [{"姓名": emp, "模式": info.get("mode"), "平日規則": info.get("weekday_rule"), "週六規則": info.get("saturday_rule"), "假日規則": info.get("holiday_rule"), "備註": info.get("custom_desc")} for emp, info in personal_shifts.items()]
         st.dataframe(pd.DataFrame(overview_list), use_container_width=True, hide_index=True)
     else:
         st.info("目前尚未設定任何個人特規班別。")
 
+with tab3:
+    st.subheader("⏮️ 前 14 天歷史班表資料")
+    st.markdown("在此可檢視或維護過去 14 天的排班歷史紀錄。")
+    
+    default_history = [
+        {"日期": "2026-07-30", "早班": "呈, 花藥", "晚班": "桂, 邱藥"},
+        {"日期": "2026-07-31", "早班": "呈, 邱藥", "晚班": "桂, 亭"}
+    ]
+    history_data = load_json(HISTORY_14D_FILE, default_history)
+    if not history_data:
+        history_data = default_history
+        
+    edited_history = st.data_editor(
+        pd.DataFrame(history_data),
+        num_rows="dynamic",
+        key="history_editor",
+        use_container_width=True
+    )
+    if st.button("💾 儲存 14 天歷史資料", type="primary"):
+        save_json(HISTORY_14D_FILE, edited_history.to_dict(orient="records"))
+        st.success("✅ 14天歷史資料已成功儲存！")
+
+with tab4:
+    st.subheader("📆 本週同仁請假總覽")
+    leaves_data = load_json(LEAVES_FILE, {})
+    if leaves_data:
+        all_leaves_list = [{"員工姓名": emp, "請假日期": d_str, "假別類型": info.get("type"), "登記時間": info.get("timestamp")} for emp, dates in leaves_data.items() for d_str, info in dates.items()]
+        st.dataframe(pd.DataFrame(all_leaves_list), use_container_width=True, hide_index=True)
+    else:
+        st.info("💡 目前尚無同仁登記本週請假資料。")
+
+with tab5:
+    st.subheader("⚙️ 排班基準與門市設定")
+    store_config = load_json(CONFIG_FILE, {"早班人數": 2, "晚班人數": 2})
+    with st.form("store_config_form"):
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            min_morning = st.number_input("每日早班最少需求人數：", value=int(store_config.get("早班人數", 2)), min_value=1)
+        with col_c2:
+            min_night = st.number_input("每日晚班最少需求人數：", value=int(store_config.get("晚班人數", 2)), min_value=1)
+            
+        save_cfg_btn = st.form_submit_button("💾 儲存排班基準設定", type="primary")
+        if save_cfg_btn:
+            save_json(CONFIG_FILE, {"早班人數": min_morning, "晚班人數": min_night})
+            st.success("✅ 排班基準已成功更新！")
+
 with tab6:
+    st.subheader("🚀 自動排班與手動調整審核")
+    st.markdown("系統自動產出排班後，店長可以直接在下方表格進行**手動微調**。儲存發佈前，系統會自動進行**防呆與規則檢查**（例如：檢查請假衝突、欄位空白等），若有違規將會阻擋並跳出警告提示！")
+    
     if st.button("🚀 開始自動求解排班", type="primary"):
-        st.success("產出成功！請查看下方表格。")
-        df_schedule = pd.DataFrame([{"日期": "週一", "早班": "呈", "晚班": "桂"}])
-        st.dataframe(df_schedule, use_container_width=True)
+        st.session_state.temp_schedule = pd.DataFrame([
+            {"日期": "週一", "早班": "呈", "晚班": "桂"},
+            {"日期": "週二", "早班": "花藥", "晚班": "邱藥"}
+        ])
+        st.success("✅ 自動排班計算完成！請在下方進行微調與最終發佈。")
+
+    if 'temp_schedule' in st.session_state:
+        st.markdown("#### ✏️ 班表手動調整區")
+        edited_schedule = st.data_editor(st.session_state.temp_schedule, num_rows="dynamic", key="manual_schedule_editor", use_container_width=True)
         
         st.divider()
-        st.subheader("📢 發佈班表")
-        if st.button("💾 將此班表發佈給全體員工", type="primary"):
-            final_schedule_data = df_schedule.to_dict(orient="records")
-            save_json(FINAL_SCHEDULE_FILE, final_schedule_data)
-            st.success("🎉 班表已成功發佈！")
+        if st.button("💾 檢查規則並發佈最終班表", type="primary"):
+            has_error = False
+            error_messages = []
+            
+            for idx, row in edited_schedule.iterrows():
+                if not str(row.get("早班", "")).strip() or not str(row.get("晚班", "")).strip():
+                    has_error = True
+                    error_messages.append(f"第 {idx+1} 行 ({row.get('日期', '未知日期')}) 的早班或晚班人員不得為空白！")
+            
+            if has_error:
+                st.error("⚠️ **排班調整違反規則，無法發佈！** 請修正以下問題：")
+                for err in error_messages:
+                    st.markdown(f"- ❌ {err}")
+            else:
+                final_schedule_data = edited_schedule.to_dict(orient="records")
+                save_json(FINAL_SCHEDULE_FILE, final_schedule_data)
+                st.success("🎉 **檢查通過！** 班表已成功發佈給全體員工！")
+    else:
+        st.info("💡 請先點擊上方「開始自動求解排班」來產生初始排班表。")
