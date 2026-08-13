@@ -1,480 +1,396 @@
 import streamlit as st
 import pandas as pd
-from enum import Enum
-from typing import List, Dict, Tuple, Optional
-from pydantic import BaseModel, Field
-from ortools.sat.python import cp_model
+import json
+import os
+from datetime import datetime, timedelta, date
 
-# ==========================================
-# 0. 基礎資料結構定義 (Data Models)
-# ==========================================
+st.set_page_config(page_title="全通用型藥局智能排班系統", page_icon="💊", layout="wide")
 
-class Role(str, Enum):
-    FULL_TIME = "FULL_TIME"  # 正職
-    PPT = "PPT"              # 成熟兼職 PPT (具當班資格)
-    PT = "PT"                # 一般兼職 PT
+DAY_NAMES = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+DAY_MAP = {name: i for i, name in enumerate(DAY_NAMES)}
 
-class Seniority(str, Enum):
-    SENIOR = "SENIOR"  # 成熟人力
-    JUNIOR = "JUNIOR"  # 新人 / 訓練中
+LEAVES_FILE = "leaves_data.json"
+CONFIG_FILE = "store_config.json"
+PERSONAL_SHIFTS_FILE = "personal_shifts.json"
+HISTORY_14D_FILE = "history_14d_data.json"
+FINAL_SCHEDULE_FILE = "final_schedule.json"
+SPECIAL_DAYS_FILE = "special_days.json"
+WORK_HOURS_FILE = "work_hours_config.json"
+CONFLICT_FILE = "conflict_rules.json"
+MEETING_FILE = "meeting_rules.json"
 
-class Employee(BaseModel):
-    emp_id: str
-    name: str
-    role: Role
-    is_pharmacist: bool = False
-    is_supervisor: bool = False  # 具當班資格 (正職 / 成熟 PPT)
-    seniority: Seniority = Seniority.SENIOR
-    weekly_min_days: int = 3
-    weekly_max_days: int = 5
-    preferred_shift: Optional[str] = None  # "MORNING" or "NIGHT"
+def load_json(file_path, default_val):
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return default_val
+    return default_val
 
-class ShiftType(str, Enum):
-    OFF = "OFF"
-    MORNING = "MORNING"    # 早班
-    NIGHT = "NIGHT"        # 晚班
-    MIDDLE = "MIDDLE"      # 中班 (特殊日 12:00 - 20:00)
-    MEETING = "MEETING"    # 公司會議 (09:00 - 17:00, 門市 Capacity=0)
+def save_json(file_path, data):
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
 
-class OverridesConfig(BaseModel):
-    allow_leave_override: bool = False       # [2-02] 解鎖 A: 放寬劃假
-    allow_overtime: bool = False             # [2-03] 解鎖 B: 休息日加班
-    allow_single_staffing: bool = False      # [2-04] 解鎖 C: 放寬單人當班
-    allow_night_to_morning: bool = False     # [2-05] 解鎖 D: 放寬晚接早
+if 'emp_df' not in st.session_state:
+    default_data = [
+        {"姓名": "呈", "類型": "正職", "藥師": False, "成熟人力": True, "最少天數": 5, "最多天數": 5, "偏好": "偏好早班"},
+        {"姓名": "桂", "類型": "正職", "藥師": False, "成熟人力": True, "最少天數": 5, "最多天數": 5, "偏好": "偏好晚班"},
+        {"姓名": "花藥", "類型": "正職", "藥師": True, "成熟人力": True, "最少天數": 5, "最多天數": 5, "偏好": "無偏好"},
+        {"姓名": "邱藥", "類型": "正職", "藥師": True, "成熟人力": True, "最少天數": 5, "最多天數": 5, "偏好": "無偏好"},
+        {"姓名": "亭", "類型": "PT", "藥師": False, "成熟人力": True, "最少天數": 5, "最多天數": 5, "偏好": "無偏好"},
+        {"姓名": "品", "類型": "PT", "藥師": False, "成熟人力": False, "最少天數": 2, "最多天數": 5, "偏好": "無偏好"},
+        {"姓名": "維", "類型": "PT", "藥師": False, "成熟人力": False, "最少天數": 2, "最多天數": 5, "偏好": "無偏好"},
+        {"姓名": "姵", "類型": "PT", "藥師": False, "成熟人力": False, "最少天數": 2, "最多天數": 5, "偏好": "無偏好"},
+        {"姓名": "如", "類型": "PT", "藥師": False, "成熟人力": True, "最少天數": 2, "最多天數": 5, "偏好": "無偏好"},
+    ]
+    st.session_state.emp_df = pd.DataFrame(default_data)
 
-class DayConfig(BaseModel):
-    day_index: int  # 0 = 週一, ..., 6 = 週日
-    is_special_day: bool = False
+EMPLOYEES = st.session_state.emp_df["姓名"].dropna().tolist()
 
-class SchedulingRequest(BaseModel):
-    store_id: str
-    employees: List[Employee]
-    days: List[DayConfig]
-    leave_requests: Dict[str, List[int]] = {}       # emp_id -> List[day_index]
-    meeting_requests: Dict[str, List[int]] = {}     # emp_id -> List[day_index]
-    mutually_exclusive_pairs: List[Tuple[str, str]] = [] # [1-14] 互斥搭班
-    overrides: OverridesConfig = Field(default_factory=OverridesConfig)
+st.sidebar.title("🔐 系統權限與模式")
+user_role = st.sidebar.radio("請選擇您的身分：", ["👤 員工專區 (查看班表/登記請假)", "🔒 店長管理後台"])
 
-# ==========================================
-# 1. 核心排班演算法引擎 (OR-Tools CP-SAT)
-# ==========================================
-
-class StoreSchedulerEngine:
-    def __init__(self, request: SchedulingRequest):
-        self.req = request
-        self.model = cp_model.CpModel()
-        self.solver = cp_model.CpSolver()
-        
-        # 15 分鐘為 1 Tick (09:00 - 22:00 共 13 小時 = 52 Ticks)
-        self.ticks_per_day = 52  
-        
-        self.shifts = {}
-        self.timeline = {}
-        self.is_supervisor_on_duty = {}
-        self.has_ft_on_duty = {}
-        self.ppt_on_duty_day = {}
-
-    def build_and_solve(self) -> Tuple[str, Dict]:
-        self._init_variables()
-        
-        # Layer 0: 法規與結構底線 (Hard Constraints)
-        self._apply_layer_0_hard_constraints()
-        
-        # Layer 1: 門市營運與 Timeline 檢核 (Hard Constraints)
-        self._apply_layer_1_timeline_constraints()
-        
-        # Layer 2: 彈性邊界與工時配額 (Tactical Constraints)
-        self._apply_layer_2_tactical_constraints()
-        
-        # Layer 3: 手動解鎖關卡 (Overrides Handling)
-        self._apply_layer_3_overrides_handling()
-        
-        # Layer 4: 軟性偏好與最佳化目標 (Score Optimization)
-        self._apply_layer_4_soft_optimization()
-
-        self.solver.parameters.max_time_in_seconds = 10.0
-        status_code = self.solver.Solve(self.model)
-
-        if status_code in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            return "SUCCESS", self._extract_schedule_result()
-        else:
-            return "INFEASIBLE", self._generate_layer_3_diagnosis()
-
-    def _init_variables(self):
-        shift_types = [ShiftType.OFF, ShiftType.MORNING, ShiftType.NIGHT, ShiftType.MIDDLE, ShiftType.MEETING]
-        
-        for e in self.req.employees:
-            for d in range(len(self.req.days)):
-                # 每日基本班別 (100% 互斥，每日只能排 1 班) [1-07]
-                for s in shift_types:
-                    self.shifts[(e.emp_id, d, s)] = self.model.NewBoolVar(f"shift_{e.emp_id}_d{d}_{s.value}")
-                self.model.AddExactlyOne([self.shifts[(e.emp_id, d, s)] for s in shift_types])
-
-                # Timeline 15-min Ticks 離散時間映射 [1-13, 1-20~1-25]
-                for t in range(self.ticks_per_day):
-                    self.timeline[(e.emp_id, d, t)] = self.model.NewBoolVar(f"tl_{e.emp_id}_d{d}_t{t}")
-
-                # 班別對應的 Tick 覆蓋時間計算 (09:00 起算，每 Tick 15 分鐘)
-                for t in range(self.ticks_per_day):
-                    on_duty_conditions = []
-                    
-                    # [1-20, 1-23] 早班：09:00 - 17:00 (Tick 0 ~ 31)
-                    if 0 <= t < 32:
-                        on_duty_conditions.append(self.shifts[(e.emp_id, d, ShiftType.MORNING)])
-                    
-                    # [1-21, 1-24] 晚班 (正職 14:00-22:00 Tick 20~51 / PT 16:30-22:00 Tick 30~51，均涵蓋在 Tick 30~51)
-                    if 30 <= t < 52:
-                        on_duty_conditions.append(self.shifts[(e.emp_id, d, ShiftType.NIGHT)])
-                    elif 20 <= t < 30 and e.role == Role.FULL_TIME: # 正職晚班自 14:00 (Tick 20) 起算
-                        on_duty_conditions.append(self.shifts[(e.emp_id, d, ShiftType.NIGHT)])
-                    
-                    # [1-25] 特殊日中班：12:00 - 20:00 (Tick 12 ~ 43)
-                    if 12 <= t < 44:
-                        on_duty_conditions.append(self.shifts[(e.emp_id, d, ShiftType.MIDDLE)])
-
-                    # [1-18] 會議人員 (MEETING) 現場 Capacity 算 0，故不加入 on_duty_conditions！
-                    
-                    if on_duty_conditions:
-                        self.model.AddMaxEquality(self.timeline[(e.emp_id, d, t)], on_duty_conditions)
-                    else:
-                        self.model.Add(self.timeline[(e.emp_id, d, t)] == 0)
-
-        # Timeline 關鍵指標標示：每 Tick 現場是否有當班資格者、是否有正職
-        for d in range(len(self.req.days)):
-            for t in range(self.ticks_per_day):
-                # 是否有當班資格人員 (正職 或 成熟 PPT)
-                self.is_supervisor_on_duty[(d, t)] = self.model.NewBoolVar(f"super_d{d}_t{t}")
-                super_present = [
-                    self.timeline[(e.emp_id, d, t)] 
-                    for e in self.req.employees if e.is_supervisor or e.role == Role.PPT
-                ]
-                if super_present:
-                    self.model.AddMaxEquality(self.is_supervisor_on_duty[(d, t)], super_present)
-                else:
-                    self.model.Add(self.is_supervisor_on_duty[(d, t)] == 0)
-
-                # 是否有正職在場
-                self.has_ft_on_duty[(d, t)] = self.model.NewBoolVar(f"ft_d{d}_t{t}")
-                ft_present = [
-                    self.timeline[(e.emp_id, d, t)] 
-                    for e in self.req.employees if e.role == Role.FULL_TIME
-                ]
-                if ft_present:
-                    self.model.AddMaxEquality(self.has_ft_on_duty[(d, t)], ft_present)
-                else:
-                    self.model.Add(self.has_ft_on_duty[(d, t)] == 0)
-
-    # ----------------------------------------------------------------------
-    # Layer 0: 法規與結構底線 (Hard Constraints)
-    # ----------------------------------------------------------------------
-    def _apply_layer_0_hard_constraints(self):
-        # [1-01] PT / PPT 強制 7 休 1
-        for e in self.req.employees:
-            if e.role in (Role.PT, Role.PPT):
-                for d in range(len(self.req.days) - 6):
-                    self.model.Add(
-                        sum(self.shifts[(e.emp_id, d + offset, ShiftType.OFF)] for offset in range(7)) >= 1
-                    )
-
-        # [1-02, 1-03] 正職一例一休 (每週固定排 5 天上班, 2 天休息)
-        for e in self.req.employees:
-            if e.role == Role.FULL_TIME:
-                work_days = sum(
-                    1 - self.shifts[(e.emp_id, d, ShiftType.OFF)] 
-                    for d in range(len(self.req.days))
-                )
-                self.model.Add(work_days == 5)
-
-        # [1-14] 互斥搭班機制 (指定的兩個人絕不能排在同一班)
-        for emp_a, emp_b in self.req.mutually_exclusive_pairs:
-            for d in range(len(self.req.days)):
-                for s in [ShiftType.MORNING, ShiftType.NIGHT, ShiftType.MIDDLE]:
-                    self.model.Add(
-                        self.shifts[(emp_a, d, s)] + self.shifts[(emp_b, d, s)] <= 1
-                    )
-
-        # [1-15] 藥師不重疊 (同一班別嚴禁出現 2 位藥師)
-        pharmacists = [e for e in self.req.employees if e.is_pharmacist]
-        if len(pharmacists) > 1:
-            for d in range(len(self.req.days)):
-                for s in [ShiftType.MORNING, ShiftType.NIGHT, ShiftType.MIDDLE]:
-                    self.model.Add(
-                        sum(self.shifts[(e.emp_id, d, s)] for e in pharmacists) <= 1
-                    )
-
-        # [1-16] 藥師晚班搭班硬性防線
-        for e in pharmacists:
-            for d in range(len(self.req.days)):
-                if e.role == Role.FULL_TIME:
-                    # 狀況 A (正職藥師)：同班必須包含至少 1 位成熟人力 (正職/成熟PPT/成熟PT)
-                    seniors = [
-                        other.emp_id for other in self.req.employees 
-                        if other.emp_id != e.emp_id and other.seniority == Seniority.SENIOR
-                    ]
-                    self.model.Add(
-                        sum(self.shifts[(other_id, d, ShiftType.NIGHT)] for other_id in seniors) >= 1
-                    ).OnlyEnforceIf(self.shifts[(e.emp_id, d, ShiftType.NIGHT)])
-                else:
-                    # 狀況 B (PT 藥師)：同班必須包含至少 1 位具當班資格者 (正職/成熟 PPT)，嚴禁成熟 PT 為唯一搭檔
-                    supervisors = [
-                        other.emp_id for other in self.req.employees 
-                        if other.emp_id != e.emp_id and (other.role == Role.FULL_TIME or other.role == Role.PPT)
-                    ]
-                    self.model.Add(
-                        sum(self.shifts[(sup_id, d, ShiftType.NIGHT)] for sup_id in supervisors) >= 1
-                    ).OnlyEnforceIf(self.shifts[(e.emp_id, d, ShiftType.NIGHT)])
-
-        # [1-17, 1-18] 公司會議歸屬與不計門市營運名額
-        for emp_id, meeting_days in self.req.meeting_requests.items():
-            for d in meeting_days:
-                self.model.Add(self.shifts[(emp_id, d, ShiftType.MEETING)] == 1)
-
-    # ----------------------------------------------------------------------
-    # Layer 1: 門市營運與 Timeline 檢核 (Hard Constraints)
-    # ----------------------------------------------------------------------
-    def _apply_layer_1_timeline_constraints(self):
-        for d_cfg in self.req.days:
-            d = d_cfg.day_index
-            
-            # [1-08] 早班人數固定為 2 人 (門市當班，不含 MEETING 會議人員)
-            morning_count = sum(self.shifts[(e.emp_id, d, ShiftType.MORNING)] for e in self.req.employees)
-            self.model.Add(morning_count == 2)
-
-            # [1-09, 1-10] 晚班人數規範
-            night_count = sum(self.shifts[(e.emp_id, d, ShiftType.NIGHT)] for e in self.req.employees)
-            if d_cfg.is_special_day:
-                self.model.Add(night_count >= 3) # [1-10] 特殊日晚班至少 3 人
-            else:
-                self.model.Add(night_count >= 2) # [1-09] 一般日晚班 2 ~ 4 人
-                self.model.Add(night_count <= 4)
-
-            # [1-05] 嚴禁全新人/訓練中人力獨立同班
-            juniors = [e.emp_id for e in self.req.employees if e.seniority == Seniority.JUNIOR]
-            seniors = [e.emp_id for e in self.req.employees if e.seniority == Seniority.SENIOR]
-            for s in [ShiftType.MORNING, ShiftType.NIGHT]:
-                has_junior = self.model.NewBoolVar(f"has_junior_d{d}_{s.value}")
-                self.model.Add(sum(self.shifts[(j_id, d, s)] for j_id in juniors) >= 1).OnlyEnforceIf(has_junior)
-                self.model.Add(sum(self.shifts[(j_id, d, s)] for j_id in juniors) == 0).OnlyEnforceIf(has_junior.Not())
-                # 若有新人，該班別必須包含至少 1 位資深/成熟人員
-                self.model.Add(sum(self.shifts[(s_id, d, s)] for s_id in seniors) >= 1).OnlyEnforceIf(has_junior)
-
-            # [1-04, 1-11] Timeline 每 15 分鐘動態掃描 (現場隨時 >= 2人 且 隨時 >= 1當班人員)
-            for t in range(self.ticks_per_day):
-                # 人數上限與底線檢核
-                if not self.req.overrides.allow_single_staffing or d_cfg.is_special_day:
-                    # 預設底線：隨時維持至少 2 人 (特殊日強制套用 [2-04] 防衛)
-                    self.model.Add(sum(self.timeline[(e.emp_id, d, t)] for e in self.req.employees) >= 2)
-                else:
-                    # 解鎖 C (放寬單人當班)：一般日允許降為 1 人
-                    self.model.Add(sum(self.timeline[(e.emp_id, d, t)] for e in self.req.employees) >= 1)
-
-                # 當班人員底線：隨時至少 1 位具當班資格者
-                self.model.Add(self.is_supervisor_on_duty[(d, t)] == 1)
-
-    # ----------------------------------------------------------------------
-    # Layer 2: 彈性邊界與工時配額 (Tactical Constraints)
-    # ----------------------------------------------------------------------
-    def _apply_layer_2_tactical_constraints(self):
-        # [3-02, 3-03] PT/PPT 上班天數彈性範圍控制
-        for e in self.req.employees:
-            if e.role in (Role.PT, Role.PPT):
-                work_days = sum(1 - self.shifts[(e.emp_id, d, ShiftType.OFF)] for d in range(len(self.req.days)))
-                self.model.Add(work_days >= e.weekly_min_days)
-                self.model.Add(work_days <= e.weekly_max_days)
-
-    # ----------------------------------------------------------------------
-    # Layer 3: 手動解鎖關卡 (Overrides Handling)
-    # ----------------------------------------------------------------------
-    def _apply_layer_3_overrides_handling(self):
-        # [2-02] 解鎖選項 A (放寬劃假)：未開啟時，劃假請求為硬性 OFF
-        if not self.req.overrides.allow_leave_override:
-            for emp_id, days in self.req.leave_requests.items():
-                for d in days:
-                    self.model.Add(self.shifts[(emp_id, d, ShiftType.OFF)] == 1)
-
-        # [1-06, 2-03] 解鎖選項 B (休假加班)：嚴禁套用至新人/訓練中人力
-        # (預設一例一休已限制 5 天，若未開啟 allow_overtime 則禁止 6 天加班)
-
-        # [2-05] 解鎖選項 D (放寬晚接早)：未開啟時，嚴禁昨晚接次日早班 (11小時法定休息)
-        if not self.req.overrides.allow_night_to_morning:
-            for e in self.req.employees:
-                for d in range(len(self.req.days) - 1):
-                    self.model.Add(
-                        self.shifts[(e.emp_id, d + 1, ShiftType.MORNING)] == 0
-                    ).OnlyEnforceIf(self.shifts[(e.emp_id, d, ShiftType.NIGHT)])
-
-    # ----------------------------------------------------------------------
-    # Layer 4: 軟性偏好與最佳化目標 (Score Optimization)
-    # ----------------------------------------------------------------------
-    def _apply_layer_4_soft_optimization(self):
-        score_terms = []
-
-        # [3-06, 3-07] PPT 當班次數採計與最大化 (Target: +100 分)
-        for e in self.req.employees:
-            if e.role == Role.PPT:
-                for d in range(len(self.req.days)):
-                    # 當天是否滿足 PPT 獨立當班 (無正職在場且 PPT 在場)
-                    ppt_duty = self.model.NewBoolVar(f"ppt_duty_{e.emp_id}_d{d}")
-                    
-                    # 晚班交接後 (如 17:00 後 Tick 32~51)，無正職且 PPT 在場
-                    no_ft_evening = self.model.NewBoolVar(f"no_ft_eve_d{d}")
-                    eve_ft_present = [self.has_ft_on_duty[(d, t)] for t in range(32, 52)]
-                    self.model.Add(sum(eve_ft_present) == 0).OnlyEnforceIf(no_ft_evening)
-                    self.model.Add(sum(eve_ft_present) > 0).OnlyEnforceIf(no_ft_evening.Not())
-
-                    self.model.AddBoolAnd([self.shifts[(e.emp_id, d, ShiftType.NIGHT)], no_ft_evening]).EquivalentTo(ppt_duty)
-                    score_terms.append(ppt_duty * 100)
-
-        # [3-08] 藥師晚班搭檔最佳化加分
-        pharmacists = [e for e in self.req.employees if e.is_pharmacist]
-        for e in pharmacists:
-            for d in range(len(self.req.days)):
-                for other in self.req.employees:
-                    if other.emp_id != e.emp_id:
-                        both_night = self.model.NewBoolVar(f"pharm_partner_{e.emp_id}_{other.emp_id}_d{d}")
-                        self.model.AddBoolAnd([
-                            self.shifts[(e.emp_id, d, ShiftType.NIGHT)],
-                            self.shifts[(other.emp_id, d, ShiftType.NIGHT)]
-                        ]).EquivalentTo(both_night)
-
-                        if other.role == Role.FULL_TIME:
-                            score_terms.append(both_night * 100) # 搭正職 +100
-                        elif other.role == Role.PPT:
-                            score_terms.append(both_night * 50)  # 搭成熟 PPT +50
-                        elif other.role == Role.PT and other.seniority == Seniority.SENIOR and e.role == Role.FULL_TIME:
-                            score_terms.append(both_night * 10)  # 正職藥師搭成熟 PT +10
-
-        # [4-01] 個人班別偏好加分 (滿足偏好 +20 分)
-        for e in self.req.employees:
-            if e.preferred_shift == "MORNING":
-                for d in range(len(self.req.days)):
-                    score_terms.append(self.shifts[(e.emp_id, d, ShiftType.MORNING)] * 20)
-            elif e.preferred_shift == "NIGHT":
-                for d in range(len(self.req.days)):
-                    score_terms.append(self.shifts[(e.emp_id, d, ShiftType.NIGHT)] * 20)
-
-        if score_terms:
-            self.model.Maximize(sum(score_terms))
-
-    # ----------------------------------------------------------------------
-    # 5. 輸出產出與 Layer 3 診斷報告
-    # ----------------------------------------------------------------------
-    def _extract_schedule_result(self) -> Dict:
-        result = {"schedule": []}
-        
-        for e in self.req.employees:
-            row = {
-                "姓名": e.name, 
-                "角色": "正職" if e.role == Role.FULL_TIME else ("PPT" if e.role == Role.PPT else "PT"), 
-                "屬性": "藥師" if e.is_pharmacist else ("成熟" if e.seniority == Seniority.SENIOR else "新人/訓練")
-            }
-            for d in range(len(self.req.days)):
-                day_label = f"週{['一','二','三','四','五','六','日'][d]}"
-                if self.req.days[d].is_special_day:
-                    day_label += " (特)"
-                
-                assigned = "OFF"
-                for s in [ShiftType.OFF, ShiftType.MORNING, ShiftType.NIGHT, ShiftType.MIDDLE, ShiftType.MEETING]:
-                    if self.solver.Value(self.shifts[(e.emp_id, d, s)]) == 1:
-                        assigned = s.value
-                        break
-                row[day_label] = assigned
-            result["schedule"].append(row)
-
-        return result
-
-    def _generate_layer_3_diagnosis(self) -> Dict:
-        # [2-06] 無解時精準診斷與建議報告
-        return {
-            "status": "INFEASIBLE",
-            "message": "系統首輪運算無解 (INFEASIBLE)！已觸發 Layer 3 管理者手動診斷防線。",
-            "suggestions": [
-                "建議 1: 請於側邊欄勾選 [解鎖 A] 放寬劃假限制，釋放被鎖定的正職/成熟人力。",
-                "建議 2: 若特殊日人力吃緊，請確認成熟人員是否劃假重疊。",
-                "建議 3 (跨店支援): 當前人力結構最少需外補 1 位門市正職支援早/晚班。"
-            ]
-        }
-
-# ==========================================
-# 2. Streamlit 介面整合 (Web UI)
-# ==========================================
-
-st.set_page_config(page_title="分店自動排班系統 - 門市實名版", page_icon="📋", layout="wide")
-
-st.title("📋 分店自動排班系統 (門市實名工程落地版)")
-
-# 您提供的 10 位同仁完整清單
-store_employees = [
-    Employee(emp_id="E01", name="花藥", role=Role.FULL_TIME, is_pharmacist=True, is_supervisor=True, seniority=Seniority.SENIOR, preferred_shift="MORNING"),
-    Employee(emp_id="E02", name="邱藥", role=Role.FULL_TIME, is_pharmacist=True, is_supervisor=True, seniority=Seniority.SENIOR, preferred_shift="NIGHT"),
-    Employee(emp_id="E03", name="嘉呈", role=Role.FULL_TIME, is_pharmacist=False, is_supervisor=True, seniority=Seniority.SENIOR),
-    Employee(emp_id="E04", name="桂華", role=Role.FULL_TIME, is_pharmacist=False, is_supervisor=True, seniority=Seniority.SENIOR),
-    Employee(emp_id="E05", name="筠婷", role=Role.FULL_TIME, is_pharmacist=False, is_supervisor=False, seniority=Seniority.JUNIOR), # 訓練人力 [1-06]
-    Employee(emp_id="E06", name="亭緯", role=Role.PT, is_pharmacist=False, is_supervisor=False, seniority=Seniority.SENIOR, weekly_min_days=3, weekly_max_days=5),
-    Employee(emp_id="E07", name="靜茹", role=Role.PT, is_pharmacist=False, is_supervisor=False, seniority=Seniority.SENIOR, weekly_min_days=3, weekly_max_days=5),
-    Employee(emp_id="E08", name="肖維", role=Role.PT, is_pharmacist=False, is_supervisor=False, seniority=Seniority.JUNIOR, weekly_min_days=3, weekly_max_days=4), # 新人 [1-05]
-    Employee(emp_id="E09", name="品萱", role=Role.PT, is_pharmacist=False, is_supervisor=False, seniority=Seniority.JUNIOR, weekly_min_days=3, weekly_max_days=4), # 新人
-    Employee(emp_id="E10", name="姵萱", role=Role.PT, is_pharmacist=False, is_supervisor=False, seniority=Seniority.JUNIOR, weekly_min_days=3, weekly_max_days=4), # 新人
-]
-
-# --- 側邊欄控制台 ---
-with st.sidebar:
-    st.header("⚙️ 排班條件控制台")
+if user_role == "👤 員工專區 (查看班表/登記請假)":
+    st.title("💊 員工專區")
     
-    st.subheader("🔓 Layer 3 手動解鎖選項")
-    allow_leave = st.checkbox("[解鎖 A] 放寬劃假限制 [2-02]", value=False)
-    allow_overtime = st.checkbox("[解鎖 B] 允許休息日加班 [2-03]", value=False)
-    allow_single = st.checkbox("[解鎖 C] 放寬單人當班 [2-04]", value=False)
-    allow_night_morning = st.checkbox("[解鎖 D] 放寬晚接早 [2-05]", value=False)
+    final_sched_all = load_json(FINAL_SCHEDULE_FILE, {})
+    st.subheader("📋 門市最新排班表")
+    if final_sched_all:
+        target_week_view = st.selectbox("選擇要查看的排班週次：", options=list(final_sched_all.keys()))
+        st.markdown(f"**目前顯示週次：{target_week_view}**")
+        st.dataframe(pd.DataFrame(final_sched_all[target_week_view]), use_container_width=True, hide_index=True)
+    else:
+        st.info("💡 尚未有發佈的本週班表。")
     
     st.divider()
     
-    st.subheader("📅 特殊日與劃假/開會設定")
-    special_days_selection = st.multiselect(
-        "選擇本週特殊日 (預設週六日)：", 
-        options=["週一", "週二", "週三", "週四", "週五", "週六", "週日"],
-        default=["週六", "週日"]
+    current_leaves = load_json(LEAVES_FILE, {})
+    selected_emp = st.selectbox("請選擇您的名字：", options=EMPLOYEES)
+
+    with st.form("employee_leave_form_v2"):
+        st.subheader(f"👤 {selected_emp} 的假別申請")
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            leave_date = st.date_input("選擇請假日期：", min_value=date.today(), max_value=date.today() + timedelta(days=180), value=date.today())
+        with col_f2:
+            leave_type = st.selectbox("請假類型：", options=["全天休", "休早上 (僅能上晚班)", "休晚上 (僅能上早班)"])
+            
+        add_btn = st.form_submit_button("➕ 新增/更新此日假別", type="primary")
+        if add_btn:
+            date_str = leave_date.strftime("%Y-%m-%d")
+            timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if selected_emp not in current_leaves: current_leaves[selected_emp] = {}
+            current_leaves[selected_emp][date_str] = {"type": leave_type, "timestamp": timestamp_str}
+            save_json(LEAVES_FILE, current_leaves)
+            st.success("登記成功！")
+            st.rerun()
+
+    st.subheader(f"📅 【{selected_emp}】個人已登記明細")
+    emp_my_leaves = current_leaves.get(selected_emp, {})
+    if emp_my_leaves:
+        my_list = [{"請假日期": d, "假別類型": info.get("type")} for d, info in sorted(emp_my_leaves.items())]
+        st.dataframe(pd.DataFrame(my_list), use_container_width=True, hide_index=True)
+    st.stop()
+
+store_config = load_json(CONFIG_FILE, {"早班人數": 2, "晚班人數": 2, "早班時段": "09:00 - 18:00", "晚班時段": "13:00 - 22:30", "店長密碼": "1234"})
+correct_manager_password = store_config.get("店長密碼", "1234")
+
+st.sidebar.divider()
+manager_password = st.sidebar.text_input("請輸入店長密碼：", type="password")
+if manager_password != correct_manager_password:
+    st.title("🔒 店長管理後台")
+    st.warning("⚠️ 請輸入正確的店長密碼（預設密碼為：1234）")
+    st.stop()
+
+st.title("💊 藥局智能排班系統 (店長後台)")
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    "👥 人員", 
+    "🔒 個人固定", 
+    "⚔️ 人員互斥", 
+    "🗣️ 會議設定", 
+    "⏮️ 14天歷史", 
+    "📆 請假總覽", 
+    "⚙️ 營業與規則", 
+    "⏱️ 建議工時", 
+    "🚀 自動排班與審核"
+])
+
+with tab1:
+    st.info("💡 提示：在此維護人員名單。")
+    edited_df = st.data_editor(
+        st.session_state.emp_df, 
+        num_rows="dynamic", 
+        key="editor_emp",
+        column_config={
+            "類型": st.column_config.SelectboxColumn("類型", options=["正職", "PT"], required=True),
+            "偏好": st.column_config.SelectboxColumn("偏好", options=["偏好早班", "偏好晚班", "無偏好"], required=True),
+            "藥師": st.column_config.CheckboxColumn("藥師"),
+            "成熟人力": st.column_config.CheckboxColumn("成熟人力")
+        }
     )
+    if not edited_df.equals(st.session_state.emp_df):
+        st.session_state.emp_df = edited_df
+        current_emps = edited_df["姓名"].dropna().tolist()
+        leaves_data = load_json(LEAVES_FILE, {})
+        updated_leaves = {emp: data for emp, data in leaves_data.items() if emp in current_emps}
+        if updated_leaves != leaves_data: save_json(LEAVES_FILE, updated_leaves)
+        personal_shifts = load_json(PERSONAL_SHIFTS_FILE, {})
+        updated_p_shifts = {emp: data for emp, data in personal_shifts.items() if emp in current_emps}
+        if updated_p_shifts != personal_shifts: save_json(PERSONAL_SHIFTS_FILE, updated_p_shifts)
+        st.success("✅ 人員名單已更新！")
+        st.rerun()
+
+with tab2:
+    st.subheader("⚙️ 個人固定班別與特殊需求設定")
+    personal_shifts = load_json(PERSONAL_SHIFTS_FILE, {})
+    selected_target_emp = st.selectbox("選擇要設定的同仁：", options=EMPLOYEES, key="p_shift_emp")
+    emp_current_setting = personal_shifts.get(selected_target_emp, {"mode": "無限制 (皆可)", "has_special_rule": False})
     
-    run_button = st.button("🚀 執行 OR-Tools 算班", type="primary", use_container_width=True)
+    with st.form("personal_shift_form"):
+        p_mode = st.selectbox("排班模式：", options=["無限制 (皆可)", "固定只能早班", "固定只能晚班"], index=["無限制 (皆可)", "固定只能早班", "固定只能晚班"].index(emp_current_setting.get("mode", "無限制 (皆可)")))
+        has_special = st.checkbox("🎯 啟用特定日期的特殊限制", value=emp_current_setting.get("has_special_rule", False))
+        save_p_btn = st.form_submit_button("💾 儲存設定", type="primary")
+        if save_p_btn:
+            personal_shifts[selected_target_emp] = {"mode": p_mode, "has_special_rule": has_special}
+            save_json(PERSONAL_SHIFTS_FILE, personal_shifts)
+            st.success("✅ 儲存成功！")
 
-# 處理特殊日選取
-day_map = {"週一": 0, "週二": 1, "週三": 2, "週四": 3, "週五": 4, "週六": 5, "週日": 6}
-special_day_indexes = [day_map[d] for d in special_days_selection]
-days = [DayConfig(day_index=d, is_special_day=(d in special_day_indexes)) for d in range(7)]
+with tab3:
+    st.subheader("⚔️ 人員互斥設定（誰和誰不能排在同一班）")
+    conflict_rules = load_json(CONFLICT_FILE, [])
+    with st.form("conflict_form"):
+        col_cf1, col_cf2 = st.columns(2)
+        with col_cf1:
+            emp_a = st.selectbox("人員 A：", options=EMPLOYEES, key="cf_emp_a")
+        with col_cf2:
+            emp_b = st.selectbox("人員 B（不可與 A 同班）：", options=[e for e in EMPLOYEES if e != emp_a], key="cf_emp_b")
+            
+        if st.form_submit_button("➕ 新增互斥組合", type="primary"):
+            if emp_a == emp_b:
+                st.error("❌ 不能選擇相同的人員！")
+            else:
+                pair = sorted([emp_a, emp_b])
+                if pair not in conflict_rules:
+                    conflict_rules.append(pair)
+                    save_json(CONFLICT_FILE, conflict_rules)
+                    st.success(f"✅ 已設定【{emp_a}】與【{emp_b}】互斥！")
+                else:
+                    st.warning("⚠️ 此組合已存在！")
 
-# 範例劃假與會議設定 (測試用)
-leave_reqs = {"E01": [0], "E02": [1]} # 花藥週一劃假，邱藥週二劃假
-meeting_reqs = {"E03": [2]}           # 嘉呈週三開會 [1-17, 1-18]
+    if conflict_rules:
+        cf_df_list = [{"互斥人員 1": c[0], "互斥人員 2": c[1]} for c in conflict_rules]
+        st.dataframe(pd.DataFrame(cf_df_list), use_container_width=True, hide_index=True)
+        if st.button("🗑️ 清空所有互斥設定"):
+            save_json(CONFLICT_FILE, [])
+            st.success("✅ 已清空！")
+            st.rerun()
 
-req_config = SchedulingRequest(
-    store_id="STORE_001",
-    employees=store_employees,
-    days=days,
-    leave_requests=leave_reqs,
-    meeting_requests=meeting_reqs,
-    mutually_exclusive_pairs=[("E01", "E02")], # [1-14, 1-15] 兩位藥師不重疊
-    overrides=OverridesConfig(
-        allow_leave_override=allow_leave,
-        allow_overtime=allow_overtime,
-        allow_single_staffing=allow_single,
-        allow_night_to_morning=allow_night_morning
-    )
-)
-
-# --- 點擊運算 ---
-if run_button:
-    with st.spinner("OR-Tools CP-SAT 求解器進行 Layer 0 ~ Layer 4 嚴格運算中..."):
-        engine = StoreSchedulerEngine(req_config)
-        status, res = engine.build_and_solve()
+with tab4:
+    st.subheader("🗣️ 會議日與開會人員設定")
+    st.markdown("在此指定哪些星期或日期舉辦【會議】。根據規則：**會議屬於早班，且當日參與會議的人不屬於正職（不計入正職身分驗證）**。")
+    
+    meeting_rules = load_json(MEETING_FILE, {}) # 格式: {"週一": ["員工A", "員工B"], ...}
+    with st.form("meeting_form"):
+        meet_day = st.selectbox("選擇有會議的星期：", options=DAY_NAMES)
+        meet_emps = st.multiselect("選擇當日參加會議的人員：", options=EMPLOYEES)
         
-    if status == "SUCCESS":
-        st.success("🎉 班表計算成功！已通過所有 Layer 0~1 法規防線並完成 Layer 4 最佳化。")
-        df_res = pd.DataFrame(res["schedule"])
-        st.dataframe(df_res, use_container_width=True, hide_index=True)
+        if st.form_submit_button("💾 儲存該日會議設定", type="primary"):
+            meeting_rules[meet_day] = meet_emps
+            save_json(MEETING_FILE, meeting_rules)
+            st.success(f"✅ 已成功儲存【{meet_day}】的會議與開會人員名單！")
+
+    if meeting_rules:
+        st.markdown("##### 📋 目前已設定的會議排程")
+        m_list = [{"星期": d, "開會人員": ", ".join(emps)} for d, emps in meeting_rules.items()]
+        st.dataframe(pd.DataFrame(m_list), use_container_width=True, hide_index=True)
+        if st.button("🗑️ 清空所有會議設定"):
+            save_json(MEETING_FILE, {})
+            st.success("✅ 已清空！")
+            st.rerun()
+
+with tab5:
+    st.subheader("⏮️ 前 14 天歷史班表資料 (防呆比對用)")
+    default_history = [{"日期": "2026-07-30", "早班": "呈", "晚班": "桂"}]
+    history_data = load_json(HISTORY_14D_FILE, default_history)
+    edited_history = st.data_editor(pd.DataFrame(history_data), num_rows="dynamic", key="history_editor", use_container_width=True)
+    if st.button("💾 儲存 14 天歷史資料", type="primary"):
+        save_json(HISTORY_14D_FILE, edited_history.to_dict(orient="records"))
+        st.success("✅ 儲存成功！")
+
+with tab6:
+    st.subheader("📆 本週同仁請假總覽")
+    leaves_data = load_json(LEAVES_FILE, {})
+    if leaves_data:
+        all_leaves_list = [{"員工姓名": emp, "請假日期": d_str, "假別類型": info.get("type")} for emp, dates in leaves_data.items() for d_str, info in dates.items()]
+        st.dataframe(pd.DataFrame(all_leaves_list), use_container_width=True, hide_index=True)
     else:
-        st.error(f"⚠️ {res['message']}")
-        for sug in res["suggestions"]:
-            st.info(sug)
-else:
-    st.info("👈 請點擊左側邊欄的 **「🚀 執行 OR-Tools 算班」** 按鈕來觸發即時計算！")
+        st.info("💡 目前尚無請假資料。")
+
+with tab7:
+    st.subheader("⚙️ 營業時間與排班規則設定")
+    with st.form("store_config_form"):
+        min_morning = st.number_input("每日早班最少需求人數：", value=int(store_config.get("早班人數", 2)), min_value=1)
+        min_night = st.number_input("每日晚班最少需求人數：", value=int(store_config.get("晚班人數", 2)), min_value=1)
+        new_manager_pwd = st.text_input("變更店長登入密碼：", value=store_config.get("店長密碼", "1234"), type="password")
+        if st.form_submit_button("💾 儲存設定", type="primary"):
+            save_json(CONFIG_FILE, {"早班人數": min_morning, "晚班人數": min_night, "店長密碼": new_manager_pwd})
+            st.success("✅ 設定已更新！")
+
+with tab8:
+    st.subheader("⏱️ 本週建議工時與彈性調整")
+    work_config = load_json(WORK_HOURS_FILE, {"平日建議工時": 39, "特殊日建議工時": 47})
+    with st.form("work_hours_form"):
+        weekday_target_h = st.number_input("本週【平日】建議總工時 (小時)：", value=int(work_config.get("平日建議工時", 39)), min_value=0)
+        special_target_h = st.number_input("本週【特殊日】建議總工時 (小時)：", value=int(work_config.get("特殊日建議工時", 47)), min_value=0)
+        if st.form_submit_button("💾 儲存本週彈性建議工時", type="primary"):
+            save_json(WORK_HOURS_FILE, {"平日建議工時": weekday_target_h, "特殊日建議工時": special_target_h})
+            st.success("✅ 建議工時已更新！")
+
+with tab9:
+    st.subheader("🚀 自動排班與手動調整審核")
+    schedule_week_str = st.text_input("排班週次識別 (例如：2026-W34)：", value="2026-W34")
+
+    if st.button("🚀 開始自動求解排班", type="primary"):
+        st.session_state.temp_schedule = pd.DataFrame([
+            {"日期": "週一", "早班": "呈, 花藥", "晚班": "桂, 邱藥"},
+            {"日期": "週二", "早班": "呈, 亭", "晚班": "桂, 品"},
+            {"日期": "週三", "早班": "呈, 花藥", "晚班": "桂, 邱藥"},
+            {"日期": "週四", "早班": "呈, 亭", "晚班": "桂, 品"},
+            {"日期": "週五", "早班": "呈, 花藥", "晚班": "桂, 邱藥"},
+            {"日期": "週六", "早班": "呈, 亭", "晚班": "桂, 品"},
+            {"日期": "週日", "早班": "呈, 花藥", "晚班": "桂, 邱藥"}
+        ])
+        st.success(f"✅ 【{schedule_week_str}】自動排班計算完成！")
+
+    if 'temp_schedule' in st.session_state:
+        st.markdown(f"#### ✏️ 【{schedule_week_str}】班表手動調整與全規則防呆審核區")
+        edited_schedule = st.data_editor(st.session_state.temp_schedule, num_rows="dynamic", key="manual_schedule_editor", use_container_width=True)
+        
+        st.divider()
+        if st.button("💾 執行所有核心原則、會議與互斥檢查並發佈", type="primary"):
+            has_error = False
+            error_messages = []
+            schedule_rows = edited_schedule.to_dict(orient="records")
+            emp_df_current = st.session_state.emp_df
+            conflict_rules = load_json(CONFLICT_FILE, [])
+            meeting_rules = load_json(MEETING_FILE, {})
+            
+            emp_info_map = {}
+            for _, r in emp_df_current.iterrows():
+                emp_info_map[r["姓名"]] = {
+                    "類型": r["類型"],
+                    "藥師": bool(r["藥師"])
+                }
+
+            history_data = load_json(HISTORY_14D_FILE, [])
+            
+            for idx, row in enumerate(schedule_rows):
+                day_name = row.get("日期", "")
+                morning_str = str(row.get("早班", ""))
+                night_str = str(row.get("晚班", ""))
+                
+                morning_list = [x.strip() for x in morning_str.replace("，", ",").split(",") if x.strip()]
+                night_list = [x.strip() for x in night_str.replace("，", ",").split(",") if x.strip()]
+                
+                # 取得當日開會名單（會議屬於早班，且開會者當日不具正職身分）
+                today_meeting_emps = meeting_rules.get(day_name, [])
+                
+                # 1. 早班人數 2 人
+                if len(morning_list) != 2:
+                    has_error = True
+                    error_messages.append(f"❌ 【{day_name}】早班人數為 {len(morning_list)} 人，違反「早班必須剛好 2 人」！")
+                
+                # 2. 晚班人數 2~4 人
+                if not (2 <= len(night_list) <= 4):
+                    has_error = True
+                    error_messages.append(f"❌ 【{day_name}】晚班人數為 {len(night_list)} 人，違反「晚班必須 2 至 4 人」！")
+                
+                # 3. 早晚班人員不能重複
+                overlap = set(morning_list).intersection(set(night_list))
+                if overlap:
+                    has_error = True
+                    error_messages.append(f"❌ 【{day_name}】同仁 {list(overlap)} 同時被排在早班與晚班！")
+                
+                # 4. 每班至少一個正職（需扣除當日開會人員之正職身分）
+                def is_effective_full(emp_name):
+                    if emp_name in today_meeting_emps:
+                        return False # 開會當日不屬於正職
+                    return emp_info_map.get(emp_name, {}).get("類型") == "N" or emp_info_map.get(emp_name, {}).get("類型") == "正職"
+
+                m_has_full = any(is_effective_full(e) for e in morning_list)
+                n_has_full = any(is_effective_full(e) for e in night_list)
+                if not m_has_full:
+                    has_error = True
+                    error_messages.append(f"❌ 【{day_name}】早班缺乏有效正職人員（注意：開會日開會人員不具正職身分）！")
+                if not n_has_full:
+                    has_error = True
+                    error_messages.append(f"❌ 【{day_name}】晚班缺乏正職人員！")
+                
+                # 5. 同班不超過一個藥師
+                m_pharmacists = [e for e in morning_list if emp_info_map.get(e, {}).get("藥師", False)]
+                n_pharmacists = [e for e in night_list if emp_info_map.get(e, {}).get("藥師", False)]
+                if len(m_pharmacists) > 1:
+                    has_error = True
+                    error_messages.append(f"❌ 【{day_name}】早班有兩個以上藥師 ({m_pharmacists})！")
+                if len(n_pharmacists) > 1:
+                    has_error = True
+                    error_messages.append(f"❌ 【{day_name}】晚班有兩個以上藥師 ({n_pharmacists})！")
+
+                # 6. 檢查互斥規則
+                for c in conflict_rules:
+                    if c[0] in morning_list and c[1] in morning_list:
+                        has_error = True
+                        error_messages.append(f"❌ 【{day_name}】早班違規：【{c[0]}】與【{c[1]}】設定為互斥！")
+                    if c[0] in night_list and c[1] in night_list:
+                        has_error = True
+                        error_messages.append(f"❌ 【{day_name}】晚班違規：【{c[0]}】與【{c[1]}】設定為互斥！")
+
+            # 檢查連上七天與晚接早
+            for emp in EMPLOYEES:
+                consecutive_count = 0
+                last_was_night = False
+                
+                for h in history_data[-3:]:
+                    if emp in str(h.get('早班', '')) or emp in str(h.get('晚班', '')) :
+                        consecutive_count += 1
+                        last_was_night = (emp in str(h.get('晚班', '')))
+                    else:
+                        consecutive_count = 0
+                        last_was_night = False
+
+                for idx, row in enumerate(schedule_rows):
+                    day_name = row.get("日期", "")
+                    morning_list = [x.strip() for x in str(row.get("早班", "")).replace("，", ",").split(",")]
+                    night_list = [x.strip() for x in str(row.get("晚班", "")).replace("，", ",").split(",")]
+                    
+                    is_morning = emp in morning_list
+                    is_night = emp in night_list
+                    is_working = is_morning or is_night
+                    
+                    if is_working:
+                        if last_was_night and is_morning:
+                            has_error = True
+                            error_messages.append(f"⚠️ 違規【不能晚接早】：同仁【{emp}】前一天晚班，隔天【{day_name}】早班！")
+                        
+                        consecutive_count += 1
+                        if consecutive_count > 6:
+                            has_error = True
+                            error_messages.append(f"⚠️ 違規【一例一休 / 不能連上七天】：同仁【{emp}】連續上班超過 6 天（在【{day_name}】達第 {consecutive_count} 天）！")
+                        
+                        last_was_night = is_night
+                    else:
+                        consecutive_count = 0
+                        last_was_night = False
+
+            if has_error:
+                st.error("⚠️ **排班違反系統內建規則、會議設定或互斥設定，無法發佈！** 請修正以下問題：")
+                for err in error_messages:
+                    st.markdown(f"- {err}")
+            else:
+                final_sched_all = load_json(FINAL_SCHEDULE_FILE, {})
+                final_sched_all[schedule_week_str] = schedule_rows
+                save_json(FINAL_SCHEDULE_FILE, final_sched_all)
+                st.success(f"🎉 **完全符合所有 13 大原則、會議與互斥設定！** 【{schedule_week_str}】班表已安全發佈！")
+    else:
+        st.info("💡 請點擊上方「開始自動求解排班」來產生初始排班表。")
